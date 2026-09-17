@@ -100,8 +100,60 @@ python verify.py       # 对运行中的 API 执行一次性验收（默认 http
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/batches/{batch_id}` | 查询批次预算与当前余额（404 `BATCH_NOT_FOUND`） |
-| `GET` | `/authorizations/{request_key}` | 查询账本中的授权记录（404 `AUTHORIZATION_NOT_FOUND`） |
-| `GET` | `/health` | 健康检查，返回 `{"status": "ok"}` |
+| `GET` `/authorizations/{request_key}` | 查询账本中的授权记录（404 `AUTHORIZATION_NOT_FOUND`） |
+| `GET` `/batches/{batch_id}/authorizations` | 批次授权明细分页核对（快照稳定，见下） |
+| `GET` `/health` | 健康检查，返回 `{"status": "ok"}` |
+
+### `GET /batches/{batch_id}/authorizations` — 批次授权明细核对（分页）
+
+辐照实验结束后，值班人员按批次顺序核对每一次脉冲授权。首次请求只带 `page_size`（可省略，默认 20，范围 1–100）：
+
+```
+GET /batches/pb-1/authorizations?page_size=20
+```
+
+响应：
+
+```json
+{
+  "batch_id": "pb-1",
+  "items": [
+    {"authorization_id": 1, "request_key": "req-1", "batch_id": "pb-1", "pulses": 10, "remaining": 90},
+    {"authorization_id": 2, "request_key": "req-2", "batch_id": "pb-1", "pulses": 20, "remaining": 70}
+  ],
+  "used_pulses": 50,
+  "snapshot_remaining": 50,
+  "snapshot_budget": 100,
+  "snapshot_max_id": 5,
+  "next_position": 2
+}
+```
+
+- `items`：按授权编号（`authorization_id`）升序排列的本页授权，`remaining` 是该次扣减后的余额快照；
+- `used_pulses`：**整个快照视图**（而非仅本页）的累计已用脉冲；
+- `snapshot_remaining` / `snapshot_budget`：核对时点的快照余额与预算上限（`snapshot_remaining = snapshot_budget - used_pulses`）；
+- `snapshot_max_id`：本轮视图的固定上限（该批次首次查询时的最大授权编号），空批次为 `0`；
+- `next_position`：下一页位置（本页最后一条的授权编号）；末页为 `null`。
+
+后续请求必须同时携带首页返回的 `snapshot_max_id` 与上一页的 `next_position`：
+
+```
+GET /batches/pb-1/authorizations?page_size=20&snapshot_max_id=5&position=2
+```
+
+**快照稳定性**：服务层在首次查询时以该批次的最大授权编号固定本轮视图，之后所有页面与所有统计值都只计算 `authorization_id <= snapshot_max_id` 的授权。分页期间新产生的授权既不会混入后续页面，也不会把旧记录挤出窗口（无遗漏）；其扣减照常进行，但要等值班人员重新发起一轮核对（新的首次请求）才会出现。
+
+错误响应：
+
+- **404** `BATCH_NOT_FOUND` — 批次不存在（沿用现有机器码）；
+- **400** `PAGINATION_ERROR` — 分页参数非法且互不矛盾，包括：
+  - `page_size` 不是 1–100 的整数；
+  - `snapshot_max_id` / `position` 不是整数（`position` 须为正整数，`snapshot_max_id` 须为非负整数）；
+  - 只提供了二者之一（两者必须同时出现，或同时不出现）；
+  - `position` 不属于该批次（含编号不存在、属于其他批次），或 `position >= snapshot_max_id`；
+  - `snapshot_max_id` 不是该批次的既有授权编号。
+
+该接口为只读：任何分页参数错误都不会影响授权扣减与余额。
 
 ## 重试与幂等语义
 
@@ -137,6 +189,7 @@ python verify.py       # 对运行中的 API 执行一次性验收（默认 http
 | `INSUFFICIENT_BUDGET` | 409 | 余额不足，未扣减、未落账 |
 | `REQUEST_KEY_CONFLICT` | 409 | 同一 request_key 携带不同业务字段 |
 | `AUTHORIZATION_NOT_FOUND` | 404 | 账本中无此 request_key |
+| `PAGINATION_ERROR` | 400 | 批次授权核对分页参数非法或互相矛盾（不影响授权扣减） |
 | `VALIDATION_ERROR` | 422 | 请求体校验失败（附 `details` 字段定位） |
 | `NOT_FOUND` | 404 | 路由不存在 |
 | `INTERNAL_ERROR` | 500 | 未预期的服务端错误 |

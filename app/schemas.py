@@ -34,3 +34,26 @@ class AuthorizationResponse(BaseModel):
     batch_id: str
     pulses: int
     remaining: int
+
+
+class AuthorizationListItem(BaseModel):
+    authorization_id: int
+    request_key: str
+    batch_id: str
+    pulses: int
+    remaining: int
+
+
+class AuthorizationPageResponse(BaseModel):
+    batch_id: str
+    items: list[AuthorizationListItem]
+    # Cumulative pulses used within the pinned snapshot view.
+    used_pulses: int
+    # Balance implied by the snapshot (budget - used_pulses).
+    snapshot_remaining: int
+    snapshot_budget: int
+    # Largest authorization id included in this review run; fixed on the
+    # first request and echoed on every follow-up.
+    snapshot_max_id: int
+    # Cursor for the next page (last id of the current page), or null at end.
+    next_position: int | None = None

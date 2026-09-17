@@ -112,6 +112,163 @@ def main() -> int:
             client.get(f"/batches/{storm_batch}").json().get("remaining") == 43,
         )
 
+        # --- Batch authorization review: snapshot-stable pagination ---
+        page_batch = f"verify-pages-{run}"
+        client.post("/batches", json={"batch_id": page_batch, "budget": 100})
+        # A foreign-batch authorization created *before* the page batch's own
+        # rows: its id is smaller than the page-batch cap, which is the only
+        # shape that exercises the "position belongs to another batch" rule.
+        foreign_batch = f"verify-foreign-{run}"
+        client.post("/batches", json={"batch_id": foreign_batch, "budget": 50})
+        foreign = client.post(
+            "/authorizations",
+            json={"batch_id": foreign_batch, "request_key": f"fgn-{run}", "pulses": 5},
+        )
+        foreign_id = foreign.json()["authorization_id"]
+        # 5 authorizations of 10 pulses -> ids may not be contiguous globally,
+        # so every comparison uses the ids returned by the API.
+        page_ids = []
+        for i in range(5):
+            rr = client.post(
+                "/authorizations",
+                json={"batch_id": page_batch, "request_key": f"pg-{run}-{i}", "pulses": 10},
+            )
+            check(f"page-fixture authorize {i} -> 201", rr.status_code == 201, rr.text)
+            page_ids.append(rr.json()["authorization_id"])
+
+        first_page = client.get(f"/batches/{page_batch}/authorizations?page_size=2")
+        check("review first page -> 200", first_page.status_code == 200, first_page.text)
+        fb = first_page.json()
+        check("review first page has 2 items in id order", [it["authorization_id"] for it in fb["items"]] == page_ids[:2], first_page.text)
+        check("review pins snapshot_max_id", fb["snapshot_max_id"] == page_ids[-1], first_page.text)
+        check("review used_pulses covers whole snapshot", fb["used_pulses"] == 50, first_page.text)
+        check("review snapshot_remaining", fb["snapshot_remaining"] == 50, first_page.text)
+        check("review snapshot_budget", fb["snapshot_budget"] == 100, first_page.text)
+
+        # A new authorization is committed while the reviewer is paging.
+        between = client.post(
+            "/authorizations",
+            json={"batch_id": page_batch, "request_key": f"pg-mid-{run}", "pulses": 30},
+        )
+        check("inter-page authorize -> 201", between.status_code == 201, between.text)
+
+        seen = list(fb["items"])
+        body = fb
+        page_count = 1
+        while body.get("next_position") is not None:
+            nxt = client.get(
+                f"/batches/{page_batch}/authorizations"
+                f"?page_size=2&snapshot_max_id={body['snapshot_max_id']}&position={body['next_position']}"
+            )
+            check(f"review page {page_count + 1} -> 200", nxt.status_code == 200, nxt.text)
+            body = nxt.json()
+            check(
+                f"review page {page_count + 1} keeps pinned cap",
+                body["snapshot_max_id"] == fb["snapshot_max_id"],
+                nxt.text,
+            )
+            check(
+                f"review page {page_count + 1} keeps pinned statistics",
+                body["used_pulses"] == 50 and body["snapshot_remaining"] == 50,
+                nxt.text,
+            )
+            seen.extend(body["items"])
+            page_count += 1
+        check("multi-page review returns 3 pages", page_count == 3, str(page_count))
+        check(
+            "inter-page authorization never mixes into the run",
+            [it["authorization_id"] for it in seen] == page_ids
+            and all(it["authorization_id"] != between.json()["authorization_id"] for it in seen),
+            str([it["authorization_id"] for it in seen]),
+        )
+        check("review ends without a cursor", body["next_position"] is None, str(body.get("next_position")))
+
+        # A new run started afterwards does include the inter-page row.
+        fresh = client.get(f"/batches/{page_batch}/authorizations?page_size=20").json()
+        check(
+            "fresh review run sees the inter-page authorization and updated stats",
+            [it["authorization_id"] for it in fresh["items"]] == page_ids + [between.json()["authorization_id"]]
+            and fresh["used_pulses"] == 80
+            and fresh["snapshot_remaining"] == 20,
+            str(fresh),
+        )
+
+        # Empty batch: zero rows, cap 0, statistics reflect the untouched budget.
+        empty_batch = f"verify-empty-{run}"
+        client.post("/batches", json={"batch_id": empty_batch, "budget": 7})
+        eb = client.get(f"/batches/{empty_batch}/authorizations")
+        check("empty batch review -> 200", eb.status_code == 200, eb.text)
+        check(
+            "empty batch review shape",
+            eb.json() == {
+                "batch_id": empty_batch,
+                "items": [],
+                "used_pulses": 0,
+                "snapshot_remaining": 7,
+                "snapshot_budget": 7,
+                "snapshot_max_id": 0,
+                "next_position": None,
+            },
+            eb.text,
+        )
+
+        # Illegal pagination parameters all return the stable machine code.
+        def is_pagination_error(rr: httpx.Response) -> bool:
+            return rr.status_code == 400 and rr.json().get("code") == "PAGINATION_ERROR"
+
+        check("page_size=0 -> 400 PAGINATION_ERROR", is_pagination_error(client.get(f"/batches/{page_batch}/authorizations?page_size=0")))
+        check("page_size=101 -> 400 PAGINATION_ERROR", is_pagination_error(client.get(f"/batches/{page_batch}/authorizations?page_size=101")))
+        check("position without cap -> 400 PAGINATION_ERROR", is_pagination_error(client.get(f"/batches/{page_batch}/authorizations?position=1")))
+        check("cap without position -> 400 PAGINATION_ERROR", is_pagination_error(client.get(f"/batches/{page_batch}/authorizations?snapshot_max_id=1")))
+        check(
+            "cap from another batch -> 400 PAGINATION_ERROR",
+            is_pagination_error(
+                client.get(
+                    f"/batches/{page_batch}/authorizations"
+                    f"?snapshot_max_id={foreign_id}&position={page_ids[0]}"
+                )
+            ),
+        )
+        check(
+            "illegal position (not in batch) -> 400 PAGINATION_ERROR",
+            is_pagination_error(
+                client.get(
+                    f"/batches/{page_batch}/authorizations"
+                    f"?snapshot_max_id={page_ids[-1]}&position={foreign_id}"
+                )
+            )
+            or is_pagination_error(
+                client.get(
+                    f"/batches/{page_batch}/authorizations"
+                    f"?snapshot_max_id={page_ids[-1]}&position=99999999"
+                )
+            ),
+        )
+        check(
+            "review on unknown batch keeps 404 BATCH_NOT_FOUND",
+            client.get(f"/batches/missing-{run}/authorizations").status_code == 404
+            and client.get(f"/batches/missing-{run}/authorizations").json().get("code") == "BATCH_NOT_FOUND",
+        )
+
+        # Review (including malformed calls) is read-only: budget stays at 20
+        # after the inter-page 30-pulse authorization, and deductions work.
+        balance_after_review = client.get(f"/batches/{page_batch}")
+        check(
+            "review never moved the balance",
+            balance_after_review.json().get("remaining") == 20,
+            balance_after_review.text,
+        )
+        final_ok = client.post(
+            "/authorizations",
+            json={"batch_id": page_batch, "request_key": f"pg-last-{run}", "pulses": 20},
+        )
+        check("deduction still works after review errors", final_ok.status_code == 201 and final_ok.json().get("remaining") == 0, final_ok.text)
+        final_bad = client.post(
+            "/authorizations",
+            json={"batch_id": page_batch, "request_key": f"pg-over-{run}", "pulses": 1},
+        )
+        check("budget safety preserved after review", final_bad.status_code == 409 and final_bad.json().get("code") == "INSUFFICIENT_BUDGET", final_bad.text)
+
     if FAILURES:
         print(f"\n{len(FAILURES)} check(s) failed: {', '.join(FAILURES)}")
         return 1

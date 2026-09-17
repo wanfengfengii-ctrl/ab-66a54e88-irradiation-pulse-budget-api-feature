@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, status
+from fastapi import FastAPI, Query, status
 
 from . import services
 from .database import make_engine, make_session_factory
@@ -12,6 +12,8 @@ from .errors import register_exception_handlers
 from .models import Base
 from .schemas import (
     AuthorizationCreate,
+    AuthorizationListItem,
+    AuthorizationPageResponse,
     AuthorizationResponse,
     BatchCreate,
     BatchResponse,
@@ -68,6 +70,45 @@ def create_app(database_url: str | None = None) -> FastAPI:
     @app.get("/authorizations/{request_key}", response_model=AuthorizationResponse)
     def get_authorization(request_key: str) -> AuthorizationResponse:
         return _auth_response(services.get_authorization(session_factory, request_key))
+
+    @app.get(
+        "/batches/{batch_id}/authorizations",
+        response_model=AuthorizationPageResponse,
+    )
+    def list_batch_authorizations(
+        batch_id: str,
+        page_size: str | None = Query(default=None),
+        snapshot_max_id: str | None = Query(default=None),
+        position: str | None = Query(default=None),
+    ) -> AuthorizationPageResponse:
+        # Query params are parsed in the service layer (as strings here) so
+        # every malformed pagination input yields the stable PAGINATION_ERROR
+        # envelope instead of the generic 422 validation error.
+        page = services.list_batch_authorizations(
+            session_factory,
+            batch_id,
+            page_size_raw=page_size,
+            snapshot_max_id_raw=snapshot_max_id,
+            position_raw=position,
+        )
+        return AuthorizationPageResponse(
+            batch_id=page.batch_id,
+            items=[
+                AuthorizationListItem(
+                    authorization_id=item.authorization_id,
+                    request_key=item.request_key,
+                    batch_id=item.batch_id,
+                    pulses=item.pulses,
+                    remaining=item.remaining,
+                )
+                for item in page.items
+            ],
+            used_pulses=page.used_pulses,
+            snapshot_remaining=page.snapshot_remaining,
+            snapshot_budget=page.snapshot_budget,
+            snapshot_max_id=page.snapshot_max_id,
+            next_position=page.next_position,
+        )
 
     return app
 
