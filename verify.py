@@ -112,6 +112,82 @@ def main() -> int:
             client.get(f"/batches/{storm_batch}").json().get("remaining") == 43,
         )
 
+        # --- Batch authorization detail listing with a pinned snapshot ---
+        page_batch = f"verify-page-{run}"
+        client.post("/batches", json={"batch_id": page_batch, "budget": 1000})
+        for i in range(5):
+            client.post(
+                "/authorizations",
+                json={"batch_id": page_batch, "request_key": f"pg-{i}-{run}", "pulses": 10},
+            )
+
+        def fetch_page(page_size, position=0, snapshot_max_id=None):
+            params = {"page_size": page_size}
+            if position:
+                params["position"] = position
+            if snapshot_max_id is not None:
+                params["snapshot_max_id"] = snapshot_max_id
+            return client.get(f"/batches/{page_batch}/authorizations", params=params)
+
+        p1 = fetch_page(2)
+        check("listing first page -> 200", p1.status_code == 200, p1.text)
+        p1j = p1.json()
+        check("listing first page has 2 ascending items", [it["authorization_id"] for it in p1j["items"]] == sorted(it["authorization_id"] for it in p1j["items"]) and len(p1j["items"]) == 2, p1.text)
+        check("listing pins snapshot_max_id", isinstance(p1j["snapshot_max_id"], int), p1.text)
+        check("listing stats on first page", p1j["used_pulses"] == 50 and p1j["snapshot_remaining"] == 950 and p1j["snapshot_budget"] == 1000, p1.text)
+        check("listing first page points to next position", p1j["next_position"] == 2 and p1j["has_more"] is True, p1.text)
+
+        # New authorizations land between page 1 and page 2: the pinned view
+        # must not mix them in or drop any of the original five.
+        for i in range(3):
+            client.post(
+                "/authorizations",
+                json={"batch_id": page_batch, "request_key": f"pg-late-{i}-{run}", "pulses": 1},
+            )
+        p2 = fetch_page(2, position=p1j["next_position"], snapshot_max_id=p1j["snapshot_max_id"])
+        check("listing second page -> 200", p2.status_code == 200, p2.text)
+        p2j = p2.json()
+        check("listing keeps same snapshot while paging", p2j["snapshot_max_id"] == p1j["snapshot_max_id"], p2.text)
+        p3 = fetch_page(2, position=p2j["next_position"], snapshot_max_id=p1j["snapshot_max_id"])
+        p3j = p3.json()
+        seen = [it["authorization_id"] for it in p1j["items"] + p2j["items"] + p3j["items"]]
+        check("listing walk covers exactly the original 5, in order", seen == list(range(seen[0], seen[0] + 5)), str(seen))
+        check("listing ends with no next position", p3j["next_position"] is None and p3j["has_more"] is False, p3.text)
+        check("listing stats stay frozen at the snapshot", p3j["used_pulses"] == 50 and p3j["snapshot_remaining"] == 950, p3.text)
+
+        # A fresh first request observes the current state incl. late inserts.
+        fresh = fetch_page(50).json()
+        check("fresh listing sees later authorizations", len(fresh["items"]) == 8 and fresh["used_pulses"] == 53 and fresh["snapshot_remaining"] == 947, str(fresh))
+
+        # Empty batch.
+        empty_batch = f"verify-empty-{run}"
+        client.post("/batches", json={"batch_id": empty_batch, "budget": 9})
+        er = client.get(f"/batches/{empty_batch}/authorizations", params={"page_size": 10})
+        check("empty batch listing -> 200 with empty items", er.status_code == 200 and er.json()["items"] == [] and er.json()["snapshot_max_id"] is None and er.json()["used_pulses"] == 0 and er.json()["snapshot_remaining"] == 9, er.text)
+
+        # Error surface: unknown batch keeps BATCH_NOT_FOUND; bad paging params
+        # are a stable PAGINATION_ERROR and never change balances.
+        nf = client.get(f"/batches/missing-{run}/authorizations", params={"page_size": 10})
+        check("listing unknown batch -> 404 BATCH_NOT_FOUND", nf.status_code == 404 and nf.json().get("code") == "BATCH_NOT_FOUND", nf.text)
+        for params, label in (
+            ({"page_size": 0}, "page_size=0"),
+            ({"page_size": 201}, "page_size=201"),
+            ({"page_size": 2, "position": 1}, "position without snapshot"),
+            ({"page_size": 2, "position": 999, "snapshot_max_id": p1j["snapshot_max_id"]}, "position past end"),
+            ({"page_size": 2, "position": 0, "snapshot_max_id": 999_999_999}, "foreign snapshot id"),
+        ):
+            rr = client.get(f"/batches/{page_batch}/authorizations", params=params)
+            check(f"listing bad params ({label}) -> 400 PAGINATION_ERROR", rr.status_code == 400 and rr.json().get("code") == "PAGINATION_ERROR", rr.text)
+        check(
+            "listing errors left the balance untouched",
+            client.get(f"/batches/{page_batch}").json().get("remaining") == 947,
+        )
+        deduct_after = client.post(
+            "/authorizations",
+            json={"batch_id": page_batch, "request_key": f"pg-after-{run}", "pulses": 3},
+        )
+        check("deductions still work after listing errors", deduct_after.status_code == 201 and deduct_after.json().get("remaining") == 944, deduct_after.text)
+
     if FAILURES:
         print(f"\n{len(FAILURES)} check(s) failed: {', '.join(FAILURES)}")
         return 1

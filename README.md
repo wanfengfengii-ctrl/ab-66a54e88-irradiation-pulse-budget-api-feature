@@ -101,7 +101,49 @@ python verify.py       # 对运行中的 API 执行一次性验收（默认 http
 | --- | --- | --- |
 | `GET` | `/batches/{batch_id}` | 查询批次预算与当前余额（404 `BATCH_NOT_FOUND`） |
 | `GET` | `/authorizations/{request_key}` | 查询账本中的授权记录（404 `AUTHORIZATION_NOT_FOUND`） |
+| `GET` | `/batches/{batch_id}/authorizations` | 批次授权明细分页核对（快照固定视图，见下） |
 | `GET` | `/health` | 健康检查，返回 `{"status": "ok"}` |
+
+### `GET /batches/{batch_id}/authorizations` — 批次授权明细（分页核对）
+
+辐照实验结束后按批次顺序核对每次脉冲授权。查询参数：
+
+| 参数 | 首次请求 | 后续请求 |
+| --- | --- | --- |
+| `page_size` | 每页条数，1–200，默认 50 | 同前（可省略，回显默认值） |
+| `position` | 省略（默认 0） | 必须携带上一页返回的 `next_position` |
+| `snapshot_max_id` | 省略 | 必须携带上一页返回的 `snapshot_max_id` |
+
+**固定快照视图**：首次请求时，服务端以该批次**当前最大授权编号**固定本轮视图（`snapshot_max_id`）。之后所有翻页请求回传该编号与位置，明细行和全部统计值都**只计算到该上限**——翻页期间新产生的授权既不会混入结果，也不会把尚未读取的行挤出后续页；新授权只会出现在下一轮首次查询中。空批次首次请求返回 `snapshot_max_id: null`、空 `items`。
+
+响应（按 `authorization_id` 升序）：
+
+```json
+{
+  "batch_id": "lot-2026-001",
+  "snapshot_max_id": 15,
+  "used_pulses": 60,
+  "snapshot_remaining": 40,
+  "snapshot_budget": 100,
+  "page_size": 10,
+  "position": 0,
+  "next_position": 10,
+  "has_more": true,
+  "items": [
+    {"authorization_id": 1, "request_key": "req-a", "pulses": 10, "remaining": 90}
+  ]
+}
+```
+
+- `used_pulses` / `snapshot_remaining` / `snapshot_budget`：截至快照上限的累计已用脉冲、快照余额、预算上限（每页回显相同值）；
+- `items[].remaining`：该次授权扣减后的余额快照，与申请接口返回的一致；
+- `next_position` 为 `null`（`has_more: false`）表示已到快照末页。
+
+该接口走**只读连接**（DEFERRED 事务，WAL 下不取写锁），任何分页参数错误都不会影响授权扣减。错误：
+
+- **404** `BATCH_NOT_FOUND` — 批次不存在（沿用既有机器码）；
+- **400** `PAGINATION_ERROR` — `page_size` 越界（<1 或 >200）、`position` 为负或越过该快照末尾、`position>0` 但未带 `snapshot_max_id`、`snapshot_max_id` 非正或不属于该批次；
+- **422** `VALIDATION_ERROR` — 参数类型无法解析为整数。
 
 ## 重试与幂等语义
 
@@ -137,6 +179,7 @@ python verify.py       # 对运行中的 API 执行一次性验收（默认 http
 | `INSUFFICIENT_BUDGET` | 409 | 余额不足，未扣减、未落账 |
 | `REQUEST_KEY_CONFLICT` | 409 | 同一 request_key 携带不同业务字段 |
 | `AUTHORIZATION_NOT_FOUND` | 404 | 账本中无此 request_key |
+| `PAGINATION_ERROR` | 400 | 授权明细分页参数非法（页大小越界、位置不属于该批次快照、快照参数矛盾） |
 | `VALIDATION_ERROR` | 422 | 请求体校验失败（附 `details` 字段定位） |
 | `NOT_FOUND` | 404 | 路由不存在 |
 | `INTERNAL_ERROR` | 500 | 未预期的服务端错误 |
@@ -154,9 +197,9 @@ python verify.py       # 对运行中的 API 执行一次性验收（默认 http
 ```
 app/
   main.py       # FastAPI 应用工厂与路由（uvicorn app.main:app）
-  services.py   # 核心业务：单事务原子扣减 + 幂等重放
+  services.py   # 核心业务：单事务原子扣减、幂等重放、固定快照分页核对
   models.py     # batches / authorizations（幂等账本）两张表
-  database.py   # SQLite 引擎：WAL、busy_timeout、BEGIN IMMEDIATE
+  database.py   # SQLite：写引擎 BEGIN IMMEDIATE，只读引擎 DEFERRED；WAL、busy timeout
   schemas.py    # Pydantic 请求/响应模型
   errors.py     # 稳定机器码错误信封
 tests/          # pytest：并发、重试、进程重启

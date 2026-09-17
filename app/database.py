@@ -22,7 +22,7 @@ def _sqlite_path(database_url: str) -> str | None:
     return path
 
 
-def make_engine(database_url: str) -> Engine:
+def make_engine(database_url: str, *, begin_immediate: bool = True) -> Engine:
     if not database_url.startswith("sqlite"):
         raise ValueError(f"only sqlite URLs are supported, got: {database_url!r}")
 
@@ -48,14 +48,33 @@ def make_engine(database_url: str) -> Engine:
         cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.close()
 
-    @event.listens_for(engine, "begin")
-    def _begin_immediate(connection):
-        # Acquire the write lock when the transaction starts: concurrent
-        # writers then queue on the busy timeout instead of failing with
-        # mid-transaction lock-upgrade deadlocks.
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+    if begin_immediate:
 
+        @event.listens_for(engine, "begin")
+        def _begin_immediate(connection):
+            # Acquire the write lock when the transaction starts: concurrent
+            # writers then queue on the busy timeout instead of failing with
+            # mid-transaction lock-upgrade deadlocks.
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+
+    # Without the listener above transactions start as plain BEGIN (DEFERRED):
+    # they only take a read lock on the first SELECT, so under WAL read-only
+    # sessions never block pulse deductions.
     return engine
+
+
+def make_engines(database_url: str) -> tuple[Engine, Engine]:
+    """Return (write_engine, read_engine) for `database_url`.
+
+    The write engine opens every transaction with BEGIN IMMEDIATE; the read
+    engine uses deferred transactions so audit/listing queries never hold the
+    write lock. An in-memory database is a single shared connection, so both
+    factories share one engine there.
+    """
+    write_engine = make_engine(database_url)
+    if _sqlite_path(database_url) is None:
+        return write_engine, write_engine
+    return write_engine, make_engine(database_url, begin_immediate=False)
 
 
 def make_session_factory(engine: Engine) -> sessionmaker:
