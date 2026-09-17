@@ -1,0 +1,10 @@
+[project]
+name = "irradiation-budget-api"
+version = "1.0.0"
+description = "Idempotent pulse budget authorization API for material irradiation experiments"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
